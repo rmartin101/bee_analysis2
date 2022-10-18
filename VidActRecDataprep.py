@@ -9,6 +9,7 @@ save the video data and labels for training or validation.
 
 # Not using video reading library from torchvision.
 # It only works with old versions of ffmpeg.
+import inspect 
 import argparse
 import csv
 import ffmpeg
@@ -20,10 +21,14 @@ import random
 import sys
 import time
 import torch
+from datetime import datetime 
+from threading import Thread
 import webdataset as wds
 # Helper function to convert to images
 from torchvision import transforms
 
+# print the versions of ffmpeg and torch from the imports 
+#print("ffmpeg is from %s and torch is %s " % (ffmpeg.__path__,torch.__path__) )
 
 parser = argparse.ArgumentParser(
     description="Perform data preparation for DNN training on a video set.")
@@ -89,6 +94,12 @@ parser.add_argument(
     choices=[1, 3],
     default=3,
     help='Channels of output images.')
+parser.add_argument(
+    '--threads',
+    type=int,
+    required=False,
+    default=1,
+    help='Number of thread workers')
 
 args = parser.parse_args()
 
@@ -288,6 +299,33 @@ class VideoSampler:
 
 # Create a writer for the WebDataset
 datawriter = wds.TarWriter(args.outpath, encoder=False)
+max_thread_workers = args.threads
+
+global video_sampler_result_array
+video_sampler_result_array = [None] * max_thread_workers 
+thread_array = [None] * max_thread_workers
+
+# a wrapper entry point for the thread
+# each thread creates a video sampler object 
+def video_sampler_thread_wrapper(worker_num,path,args,row):
+    global video_sampler_result_array
+
+    now = datetime.now()
+    dt_string = now.strftime("%d/%m/%Y %H:%M:%S")
+    
+    print("%s : Thread %d running row %s " % (dt_string,worker_num,row))
+    sampler = VideoSampler(
+        video_path=path, num_samples=args.samples, frames_per_sample=args.frames_per_sample,
+        frame_interval=args.interval, out_width=args.width, out_height=args.height,
+        crop_noise=args.crop_noise, channels=args.out_channels,
+        begin_frame=row[beginf_col], end_frame=row[endf_col])    
+
+    #to try to get reproducability, set the seed 
+    #sampler.setSeed(1234)
+
+    # return the sampler object in the array, indexed by the thread worker 
+    video_sampler_result_array[worker_num] = sampler 
+    return 
 
 with open(args.datalist, newline='') as datacsv:
     conf_reader = csv.reader(datacsv)
@@ -298,70 +336,113 @@ with open(args.datalist, newline='') as datacsv:
     class_col = header.index('class')
     beginf_col = header.index('beginframe')
     endf_col = header.index('endframe')
-    for row in conf_reader:
+    loop_counter = 0
+    all_csv_rows = []
+    # get all the rows in the csv file into a list so we can hand them
+    # over to the thread workers. Each row is a video file
+    # each worker processes 1 file 
+    for row in (conf_reader):
+        all_csv_rows.append(row)
+
+    row_num = 0 # global row number used to hand out work to threads 
+    main_iterations = 0  # an exit fail safe counter in case threads choke and die
+    while (row_num < len(all_csv_rows)) and (main_iterations < len(all_csv_rows)):
+        main_iterations = main_iterations + 1 
+        row = all_csv_rows[row_num]
+        group_row_num = row_num
+        #print("top of loop, row_num is %d max is %d " % (row_num,len(all_csv_rows)))
         # Read the next video
         # Make sure that this line is sane
         if 4 != len(row):
             print(f"Row '{row}' does not have the correct number of columns (4).")
         else:
             path = row[file_col]
-            sampler = VideoSampler(
-                video_path=path, num_samples=args.samples, frames_per_sample=args.frames_per_sample,
-                frame_interval=args.interval, out_width=args.width, out_height=args.height,
-                crop_noise=args.crop_noise, channels=args.out_channels,
-                begin_frame=row[beginf_col], end_frame=row[endf_col])
-            for sample_num, frame_data in enumerate(sampler):
-                frame, video_path, frame_num = frame_data
-                base_name = os.path.basename(video_path).replace(' ', '_').replace('.', '_')
-                video_time = os.path.basename(video_path).split('.')[0]
-                # TODO FIXME Convert the time from the video to the current frame time.
-                # TODO Assuming 3fps bee videos
-                time_sec = time.mktime(time.strptime(video_time, "%Y-%m-%d %H:%M:%S"))
-                time_struct = time.localtime(time_sec + int(frame_num[0]) // 3)
-                curtime = time.strftime("%Y-%m-%d %H:%M:%S", time_struct)
-                metadata = f"{video_path},{frame_num[0]},{curtime}"
-                height, width = frame.size(2), frame.size(3)
-                # Now crop to args.width by args.height.
-                #ybegin = (height - args.height)//2
-                #xbegin = (width - args.width)//2
-                #cropped = frame[:,:,ybegin:ybegin+args.height,xbegin:xbegin+args.width]
-                # If you would like to debug (and you would like to!) check your images.
-                if 1 == args.frames_per_sample:
-                    if 3 == args.out_channels:
-                        img = transforms.ToPILImage()(frame[0]/255.0).convert('RGB')
-                    else:
-                        img = transforms.ToPILImage()(frame[0]/255.0).convert('L')
-                    # Now save the image as a png into a buffer in memory
-                    buf = io.BytesIO()
-                    img.save(fp=buf, format="png")
+            thread_worker_num = 0
+            group_row = [None] * max_thread_workers
+            # this is the main loop creating thread workers 
+            while (thread_worker_num < max_thread_workers):
+                #print("inside thread loop, row_num is %d " % (row_num))
+                row = all_csv_rows[row_num]
+                group_row[thread_worker_num] = row
+                thread_array[thread_worker_num] = Thread(target=video_sampler_thread_wrapper,args=(thread_worker_num,path,args,row))
+                thread_array[thread_worker_num].start()
+                row_num = row_num + 1                 
+                thread_worker_num = thread_worker_num + 1
+                # if we reach the last row, break out of the loop 
+                if (row_num >= len(all_csv_rows)):
+                    break;
 
-                    sample = {
-                        "__key__": '_'.join((base_name, '_'.join(frame_num))),
-                        "0.png": buf.getbuffer(),
-                        "cls": row[class_col].encode('utf-8'),
-                        "metadata.txt": metadata.encode('utf-8')
-                    }
-                else:
-                    # Save multiple pngs
-                    buffers = []
+            # loop to join all threads when they are finished 
+            for i in range(thread_worker_num):
+                thread_array[i].join()
+                print("joining thread %d " % (i))
 
-                    for i in range(args.frames_per_sample):
+            # this part of the code is sequential because the I/O for the
+            # web-data set file (WDS) is sequential
+            # could create separate files in a directory the tar into a wds file
+            # but that is too much work for now.
+
+            #print("starting sequential file build, row_num is %d workers are %d " % (row_num,thread_worker_num))
+            # for each thread workers that ran, put the data in a file 
+            for i in range(thread_worker_num):
+                row = group_row[i]  
+                sampler = video_sampler_result_array[i]
+                #print("working on outputing row %d, %s " % (i,row))
+                for sample_num, frame_data in enumerate(sampler):
+                    frame, video_path, frame_num = frame_data
+                    base_name = os.path.basename(video_path).replace(' ', '_').replace('.', '_')
+                    video_time = os.path.basename(video_path).split('.')[0]
+                    # TODO FIXME Convert the time from the video to the current frame time.
+                    # TODO Assuming 3fps bee videos
+                    time_sec = time.mktime(time.strptime(video_time, "%Y-%m-%d %H:%M:%S"))
+                    time_struct = time.localtime(time_sec + int(frame_num[0]) // 3)
+                    curtime = time.strftime("%Y-%m-%d %H:%M:%S", time_struct)
+                    metadata = f"{video_path},{frame_num[0]},{curtime}"
+                    height, width = frame.size(2), frame.size(3)
+
+                    # print("base_name is %s " % (base_name))
+                    
+                    # Now crop to args.width by args.height.
+                    #ybegin = (height - args.height)//2
+                    #xbegin = (width - args.width)//2
+                    #cropped = frame[:,:,ybegin:ybegin+args.height,xbegin:xbegin+args.width]
+                    # If you would like to debug (and you would like to!) check your images.
+                    if 1 == args.frames_per_sample:
                         if 3 == args.out_channels:
-                            img = transforms.ToPILImage()(frame[i]/255.0).convert('RGB')
+                            img = transforms.ToPILImage()(frame[0]/255.0).convert('RGB')
                         else:
-                            img = transforms.ToPILImage()(frame[i]/255.0).convert('L')
+                            img = transforms.ToPILImage()(frame[0]/255.0).convert('L')
                         # Now save the image as a png into a buffer in memory
-                        buffers.append(io.BytesIO())
-                        img.save(fp=buffers[-1], format="png")
+                        buf = io.BytesIO()
+                        img.save(fp=buf, format="png")
 
-                    sample = {
-                        "__key__": '_'.join((base_name, '_'.join(frame_num))),
-                        "cls": row[class_col].encode('utf-8'),
-                        "metadata.txt": metadata.encode('utf-8')
-                    }
-                    for i in range(args.frames_per_sample):
-                        sample[f"{i}.png"] = buffers[i].getbuffer()
+                        sample = {
+                            "__key__": '_'.join((base_name, '_'.join(frame_num))),
+                            "0.png": buf.getbuffer(),
+                            "cls": row[class_col].encode('utf-8'),
+                            "metadata.txt": metadata.encode('utf-8')
+                        }
+                    else:
+                        # Save multiple pngs
+                        buffers = []
+                        for i in range(args.frames_per_sample):
+                            if 3 == args.out_channels:
+                                img = transforms.ToPILImage()(frame[i]/255.0).convert('RGB')
+                            else:
+                                img = transforms.ToPILImage()(frame[i]/255.0).convert('L')
+                            # Now save the image as a png into a buffer in memory
+                            buffers.append(io.BytesIO())
+                            img.save(fp=buffers[-1], format="png")
 
-                datawriter.write(sample)
+                        sample = {
+                            "__key__": '_'.join((base_name, '_'.join(frame_num))),
+                            "cls": row[class_col].encode('utf-8'),
+                            "metadata.txt": metadata.encode('utf-8')
+                        }
+                        for i in range(args.frames_per_sample):
+                            sample[f"{i}.png"] = buffers[i].getbuffer()
 
+                    datawriter.write(sample)
+
+            #print("done sequential file build, row_num is %d " % (row_num))
 datawriter.close()
